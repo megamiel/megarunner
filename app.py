@@ -1,30 +1,100 @@
 from flask import Flask, request, jsonify
 import subprocess
 import sys
+import uuid
+import os
+import psycopg2 # PostgreSQLに接続するためのライブラリ
+
+# --- Vercel Postgres への接続 ---
+# Vercelが自動的に設定してくれる環境変数からデータベースの接続URLを取得
+DATABASE_URL = os.environ.get('POSTGRES_URL')
+# --- 接続設定ここまで ---
+
 
 # Flaskアプリケーションを初期化
 app = Flask(__name__)
 
-@app.route('/api/execute', methods=['POST'])
-def execute_code():
-    # POSTリクエストからJSONデータを取得
-    data = request.get_json()
-    if not data or 'code' not in data:
-        return jsonify({'error': 'No code provided'}), 400
 
-    code = data['code']
+# エンドポイント1: ファイルをアップロードして実行URLを生成
+@app.route('/api/upload', methods=['POST'])
+def upload_and_save_code():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part in the request'}), 400
+    
+    uploaded_file = request.files['file']
+    if uploaded_file.filename == '' or not uploaded_file.filename.endswith('.py'):
+        return jsonify({'error': 'Please upload a valid .py file'}), 400
 
+    conn = None # 接続オブジェクトを初期化
     try:
-        # ユーザーコードを安全に実行するための準備
+        code_content = uploaded_file.read().decode('utf-8')
+        script_id = str(uuid.uuid4())
+        
+        # データベースに接続
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        
+        # SQLクエリを実行して、Postgresにコードを保存
+        # SQLインジェクションを防ぐため、プレースホルダ(%s)を使用します
+        cursor.execute(
+            "INSERT INTO scripts (id, code) VALUES (%s, %s)",
+            (script_id, code_content)
+        )
+        # 変更を確定
+        conn.commit()
+        
+        cursor.close()
+
+        # Vercelの公開URLを取得
+        base_url = os.environ.get('VERCEL_URL', request.host_url)
+        if not base_url.startswith('https://'):
+            base_url = f'https://{base_url}'
+
+        execution_url = f"{base_url}/api/run/{script_id}"
+        
+        return jsonify({
+            'message': 'File uploaded and script created successfully!',
+            'script_id': script_id,
+            'execution_url': execution_url
+        }), 201
+
+    except Exception as e:
+        return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
+    finally:
+        # 処理が成功しても失敗しても、必ずデータベース接続を閉じる
+        if conn:
+            conn.close()
+
+
+# エンドポイント2: 保存されたコードを実行
+@app.route('/api/run/<string:script_id>', methods=['GET'])
+def run_saved_code(script_id):
+    conn = None
+    try:
+        # データベースに接続
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+
+        # IDに基づいてPostgresからコードを取得
+        cursor.execute("SELECT code FROM scripts WHERE id = %s", (script_id,))
+        result = cursor.fetchone() # 結果を1行取得
+        
+        cursor.close()
+
+        if not result:
+            return jsonify({'error': 'Script with the given ID not found'}), 404
+            
+        code_to_run = result[0]
+
+        # --- 以下は以前のコードと同じ実行ロジック ---
         process = subprocess.run(
-            [sys.executable, '-c', code],
+            [sys.executable, '-c', code_to_run],
             capture_output=True,
             text=True,
             timeout=10,
             check=False
         )
 
-        # 実行結果を返す
         return jsonify({
             'stdout': process.stdout,
             'stderr': process.stderr,
@@ -32,13 +102,11 @@ def execute_code():
         })
 
     except subprocess.TimeoutExpired:
-        return jsonify({
-            'error': 'Execution timed out (10 seconds limit)',
-            'stdout': '',
-            'stderr': 'TimeoutExpired: The code took too long to execute.'
-        }), 408
+        return jsonify({'error': 'Execution timed out (10 seconds limit)'}), 408
         
     except Exception as e:
         return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
+    finally:
+        if conn:
+            conn.close()
 
-# Vercelがこの 'app' をWSGIエントリーポイントとして認識します
