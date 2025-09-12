@@ -35,7 +35,6 @@ def upload_and_save_code():
         cursor = conn.cursor()
         
         # SQLクエリを実行して、Postgresにコードを保存
-        # SQLインジェクションを防ぐため、プレースホルダ(%s)を使用します
         cursor.execute(
             "INSERT INTO scripts (id, code) VALUES (%s, %s)",
             (script_id, code_content)
@@ -45,11 +44,11 @@ def upload_and_save_code():
         
         cursor.close()
 
-        # Vercelの公開URLを取得
-        base_url = os.environ.get('VERCEL_URL', request.host_url)
-        if not base_url.startswith('https://'):
-            base_url = f'https://{base_url}'
+        # ★★★ 変更点 ★★★
+        # プレビューURLではなく、常に本番の公開URLを返すように固定
+        base_url = "https://megarunner.vercel.app"
 
+        # 実行用のURLを生成
         execution_url = f"{base_url}/api/run/{script_id}"
         
         return jsonify({
