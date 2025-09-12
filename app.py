@@ -4,9 +4,11 @@ import sys
 import uuid
 import os
 import psycopg2
+import json # JSONを扱うためにインポート
 
 # --- Vercel Postgres への接続 ---
-DATABASE_URL = os.environ.get('POSTGRS_URL') # Vercelが自動で設定
+# Vercelが自動的に設定してくれる環境変数からデータベースの接続URLを取得
+DATABASE_URL = os.environ.get('POSTGRES_URL')
 # --- 接続設定ここまで ---
 
 
@@ -14,7 +16,7 @@ DATABASE_URL = os.environ.get('POSTGRS_URL') # Vercelが自動で設定
 app = Flask(__name__)
 
 
-# エンドポイント1: ファイルをアップロードして実行URLを生成 (変更なし)
+# エンドポイント1: ファイルをアップロードして実行URLを生成
 @app.route('/api/upload', methods=['POST'])
 def upload_and_save_code():
     if 'file' not in request.files:
@@ -55,17 +57,15 @@ def upload_and_save_code():
             conn.close()
 
 
-# エンドポイント2: 保存されたコードを実行 (★ ここからが変更点 ★)
-@app.route('/api/run/<string:script_id>', methods=['GET', 'POST']) # POSTも受け付けるように
+# エンドポイント2: 保存されたコードを実行（名前付き引数に対応）
+@app.route('/api/run/<string:script_id>', methods=['GET', 'POST'])
 def run_saved_code(script_id):
     conn = None
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
-
         cursor.execute("SELECT code FROM scripts WHERE id = %s", (script_id,))
         result = cursor.fetchone()
-        
         cursor.close()
 
         if not result:
@@ -73,26 +73,26 @@ def run_saved_code(script_id):
             
         code_to_run = result[0]
 
-        # --- ★ 引数を取得するロジック ---
-        # GETリクエストの場合はクエリパラメータから、POSTリクエストの場合はJSONボディから引数を取得
+        # --- ★ 引数を「辞書」として取得するロジック ---
+        request_data = {}
         if request.method == 'GET':
-            # URLの ?args=... から引数をリストとして取得
-            args = request.args.getlist('args')
+            # ?key=value 形式の全クエリパラメータを辞書に変換
+            request_data = request.args.to_dict()
         elif request.method == 'POST':
-            # リクエストボディのJSONから 'args' をリストとして取得
-            post_data = request.get_json()
-            args = post_data.get('args', []) if post_data else []
-        else:
-            args = []
+            # POSTされたJSONボディをそのまま辞書として使用
+            # もしJSONでなければ空の辞書にする
+            request_data = request.get_json(silent=True) or {}
+        
+        # 辞書をJSON文字列に変換して、スクリプトに渡す準備
+        args_as_json_string = json.dumps(request_data)
         # --- 引数取得ロジックここまで ---
 
-
-        # 実行するコマンドを組み立てる
-        # [ "python", "-c", "スクリプトコード", "引数1", "引数2", ... ]
-        command = [sys.executable, '-c', code_to_run] + args
+        # 実行コマンドを組み立てる
+        # [ "python", "-c", "スクリプトコード", "引数辞書のJSON文字列" ]
+        command = [sys.executable, '-c', code_to_run, args_as_json_string]
 
         process = subprocess.run(
-            command, # ★ 変更点: 引数を含むコマンドを実行
+            command,
             capture_output=True,
             text=True,
             timeout=10,
@@ -104,70 +104,10 @@ def run_saved_code(script_id):
             'stderr': process.stderr,
             'returncode': process.returncode
         })
-
-    except subprocess.TimeoutExpired:
-        return jsonify({'error': 'Execution timed out (10 seconds limit)'}), 408
         
     except Exception as e:
         return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
     finally:
         if conn:
             conn.close()
-# ```
-
-# ### 変更のポイント
-# 1.  **引数の受け取り:**
-#     * `/api/run/...` のエンドポイントが `GET` と `POST` の両方のリクエストを受け付けるようにしました。
-#     * **GET** の場合: `request.args.getlist('args')` を使って、URLの末尾の `?args=...&args=...` から引数をリストとして取得します。
-#     * **POST** の場合: `request.get_json()` を使って、リクエストのボディに含まれるJSONから引数のリストを取得します。
-# 2.  **コマンドの組み立て:**
-#     * `subprocess.run` に渡すコマンドを `[sys.executable, '-c', code_to_run] + args` のように変更しました。これにより、取得した引数がPythonスクリプトに渡されます。
-
-# ---
-
-# ### 新しいテスト方法
-
-# **1. 引数を受け取る`test.py`を作成**
-#    あなたのPythonスクリプト側で、渡された引数を受け取るには `sys.argv` を使います。
-#    以下のような新しい`test.py`を作成してください。
-
-#    **`test.py` の中身:**
-#    ```python
-#    import sys
-
-#    print("--- Script Start ---")
-#    print(f"Received {len(sys.argv) - 1} argument(s).")
-   
-#    # sys.argv[0] はスクリプト名(-c)なので、[1]からが引数
-#    for i, arg in enumerate(sys.argv[1:]):
-#        print(f"Argument {i+1}: {arg}")
-
-#    print("--- Script End ---")
-#    ```
-
-# **2. 新しい`test.py`をアップロード**
-#    まず、この新しいスクリプトをアップロードして、実行URLを取得します。
-
-#    ```bash
-#    # (test.pyがあるフォルダで実行)
-#    curl -X POST -F "file=@test.py" https://megarunner.vercel.app/api/upload
-#    ```
-#    (返ってきた`execution_url`をコピーしておきます)
-
-# **3. 引数を渡して実行！ (GETの場合)**
-#    コピーしたURLの末尾に `?args=...` を付けて実行します。
-
-#    ```bash
-#    # URLの '...' の部分は、あなたが受け取ったIDに置き換えてください
-#    curl "https://megarunner.vercel.app/api/run/...?args=Hello&args=Vercel&args=API"
-#    ```
-#    *(注意: `&` がターミナルで特別な意味を持つことがあるので、URL全体をダブルクォーテーション `"` で囲むのが安全です)*
-
-# **期待される結果:**
-# ```json
-# {
-#   "returncode": 0,
-#   "stderr": "",
-#   "stdout": "--- Script Start ---\nReceived 3 argument(s).\nArgument 1: Hello\nArgument 2: Vercel\nArgument 3: API\n--- Script End ---\n"
-# }
 
