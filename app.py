@@ -3,115 +3,141 @@ import subprocess
 import sys
 import uuid
 import os
-import psycopg2
+import pg8000.dbapi
+import ssl
 import json
-import base64 # Base64エンコードのためにインポート
+import base64
+from dotenv import load_dotenv
+from urllib.parse import urlparse
+import inspect
+import io
+import contextlib
 
-# --- Vercel Postgres への接続 ---
-DATABASE_URL = os.environ.get('POSTGRES_URL')
-# --- 接続設定ここまで ---
-
-# Flaskアプリケーションを初期化
+# --- 初期設定 ---
+load_dotenv('.env.development.local')
+DATABASE_URL = os.environ.get('POSTGRES_URL_NON_POOLING')
 app = Flask(__name__)
 
+# --- データベース接続ヘルパー ---
+def get_db_connection():
+    if not DATABASE_URL:
+        raise ValueError("データベースの接続URLが環境変数に設定されていません。")
+    parsed_url = urlparse(DATABASE_URL)
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    db_port = parsed_url.port or 5432
+    return pg8000.dbapi.connect(
+        user=parsed_url.username, password=parsed_url.password,
+        host=parsed_url.hostname, port=db_port,
+        database=parsed_url.path[1:], ssl_context=ssl_context
+    )
 
-# エンドポイント1: スクリプトをアップロード（デプロイ）する
-@app.route('/api/upload', methods=['POST'])
-def upload_and_save_code():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part in the request'}), 400
-    
-    uploaded_file = request.files['file']
-    
-    if uploaded_file.filename == '' or not uploaded_file.filename.endswith('.py'):
-        return jsonify({'error': 'Please upload a valid .py file'}), 400
-
-    conn = None
-    try:
-        code_content = uploaded_file.read().decode('utf-8')
-        script_id = str(uuid.uuid4())
-        
-        conn = psycopg2.connect(DATABASE_URL)
+# --- 実行エンジン (以前のexecutor.pyのロジックを内包) ---
+ENTRYPOINT_BOILERPLATE = "def entrypoint(func): func._is_entrypoint = True; return func"
+class DatabaseConcierge:
+    def __init__(self, script_id):
+        self.script_id = script_id
+    def set(self, key, value):
+        conn = get_db_connection()
         cursor = conn.cursor()
-        
-        cursor.execute(
-            "INSERT INTO scripts (id, code) VALUES (%s, %s)",
-            (script_id, code_content)
-        )
+        cursor.execute("INSERT INTO user_data (script_id, key, value) VALUES (%s, %s, %s) ON CONFLICT (script_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()", (self.script_id, key, json.dumps(value)))
         conn.commit()
         cursor.close()
+        conn.close()
+        return True
+    def get(self, key):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM user_data WHERE script_id = %s AND key = %s", (self.script_id, key))
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return result[0] if result else None
 
-        base_url = "https://megarunner.vercel.app"
-        execution_url = f"{base_url}/api/run/{script_id}"
-        
-        return jsonify({
-            'message': 'Script uploaded successfully!',
-            'script_id': script_id,
-            'execution_url': execution_url
-        }), 201
-
-    except Exception as e:
-        return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
-    finally:
-        if conn:
-            conn.close()
-
-
-# エンドポイント2: 保存されたスクリプトを実行する
-@app.route('/api/run/<string:script_id>', methods=['GET', 'POST'])
-def run_saved_code(script_id):
-    conn = None
+def execute_user_script(code_string, request_args, script_id):
+    result = {"stdout": "", "stderr": "", "return_value": None, "error": None}
+    stdout_capture, stderr_capture = io.StringIO(), io.StringIO()
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+            full_code = f"{ENTRYPOINT_BOILERPLATE}\n{code_string}"
+            scope = {}
+            exec(full_code, scope)
+            entry_func = next((obj for obj in scope.values() if callable(obj) and hasattr(obj, '_is_entrypoint')), None)
+            if not entry_func: raise ValueError("No @entrypoint function found.")
+            db_concierge = DatabaseConcierge(script_id)
+            entry_func.__globals__["db_set"] = db_concierge.set
+            entry_func.__globals__["db_get"] = db_concierge.get
+            sig = inspect.signature(entry_func)
+            kwargs_to_pass = {}
+            for param in sig.parameters.values():
+                if param.name in request_args:
+                    kwargs_to_pass[param.name] = request_args[param.name]
+                elif param.default is inspect.Parameter.empty:
+                    raise TypeError(f"Missing required argument: '{param.name}'")
+            result["return_value"] = entry_func(**kwargs_to_pass)
+    except Exception as e:
+        print(f"Execution Error: {e}", file=sys.stderr)
+        result["error"] = str(e)
+    finally:
+        result["stdout"] = stdout_capture.getvalue()
+        result["stderr"] = stderr_capture.getvalue()
+    return result
+
+# --- APIエンドポイント ---
+@app.route('/api/upload', methods=['POST'])
+def upload_code():
+    if 'file' not in request.files: return jsonify({'error': 'No file part'}), 400
+    file = request.files['file']
+    if not file.filename.endswith('.py'): return jsonify({'error': 'Invalid file type'}), 400
+    code, script_id = file.read().decode('utf-8'), str(uuid.uuid4())
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO scripts (id, code) VALUES (%s, %s)", (script_id, code))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e: return jsonify({'error': f'Database error: {str(e)}'}), 500
+    return jsonify({'message': 'Script uploaded!', 'script_id': script_id, 'execution_url': f"https://megarunner.vercel.app/api/run/{script_id}"}), 201
+
+@app.route('/api/run/<string:script_id>', methods=['GET', 'POST'])
+def run_code(script_id):
+    code_to_run = None
+    try:
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT code FROM scripts WHERE id = %s", (script_id,))
         result = cursor.fetchone()
         cursor.close()
+        conn.close()
+        if result: code_to_run = result[0]
+    except Exception as e: return jsonify({'error': f'Database error: {str(e)}'}), 500
+    if not code_to_run: return jsonify({'error': 'Script not found'}), 404
+    args = request.args.to_dict() if request.method == 'GET' else (request.get_json(silent=True) or {})
+    final_result = execute_user_script(code_to_run, args, script_id)
+    return jsonify(final_result)
 
-        if not result:
-            return jsonify({'error': 'Script with the given ID not found'}), 404
-            
-        code_to_run = result[0]
+# --- ★★★ これが最後の、そして最も重要な変更点です ★★★ ---
+if __name__ == "__main__":
+    # Flaskの開発用サーバーを「デバッグモード」で起動します
+    app.run(debug=True)
+# ```
 
-        request_data = {}
-        if request.method == 'GET':
-            request_data = request.args.to_dict()
-        elif request.method == 'POST':
-            request_data = request.get_json(silent=True) or {}
-        
-        args_as_json_string = json.dumps(request_data)
+# ---
 
-        # ★ 変更点 ★
-        # ユーザーコードをBase64にエンコードして、改行などの問題を回避しながら
-        # 安全に `executor.py` に渡せるようにします。
-        code_b64 = base64.b64encode(code_to_run.encode('utf-8')).decode('utf-8')
+# ### 次のステップ：最後の起動と、本当の原因の特定
 
-        # 実行エンジン `executor.py` を呼び出し、
-        # エンコードしたユーザーコードと引数JSONを標準入力で渡します。
-        process = subprocess.run(
-            [sys.executable, 'executor.py'],
-            input=f"{code_b64}\n{args_as_json_string}",
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False
-        )
-        
-        try:
-            # executor.pyから返ってきたJSONをパースします
-            final_result = json.loads(process.stdout)
-            return jsonify(final_result)
-        except json.JSONDecodeError:
-            # executor.py自体でエラーが起きた場合
-            return jsonify({
-                'error': 'Execution engine failed to produce valid JSON.',
-                'raw_stdout': process.stdout,
-                'raw_stderr': process.stderr
-            }), 500
+# 1.  この新しい`app.py`を保存します。
 
-    except Exception as e:
-        return jsonify({'error': f'An unexpected error occurred in Flask app: {str(e)}'}), 500
-    finally:
-        if conn:
-            conn.close()
+# 2.  ターミナルで、仮想環境が有効になっている（`(venv)`と表示されている）状態で、**あの最も確実なコマンド**でサーバーを起動します。
+#     ```bash
+#     .\venv\Scripts\python.exe app.py
+#     ```
+#     *(もしサーバーが動いたままなら、`Ctrl + C`で一度停止してから再起動してください)*
+
+# 3.  サーバーが起動したら、**別のターミナル**を開き、**以前`500エラー`が出た時と全く同じ`upload.py`のコマンド**を、もう一度実行してください！
+#     ```bash
+#     python upload.py stateful_counter.py
+    
 
