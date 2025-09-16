@@ -34,7 +34,7 @@ def run_command(command):
     except subprocess.CalledProcessError as e:
         print("--- エラー ---")
         # 何もコミットするものがない場合のエラーは、無視して成功とみなす
-        if "nothing to commit, working tree clean" in e.stdout:
+        if "nothing to commit, working tree clean" in e.stdout or "コミットするものがありません" in e.stdout:
             print("コミットする新しい変更はありませんでした。")
             return True # 次のステップに進むためにTrueを返す
         
@@ -55,6 +55,10 @@ def git_deploy():
 
     # 2. git commit -m "{ランダム生成}"
     commit_message = f"Auto-commit: {generate_random_string()}"
+    
+    # ★★★ ここが変更点です ★★★
+    print(f"📝 自動生成されたコミットメッセージ: \"{commit_message}\"")
+    
     if not run_command(["git", "commit", "-m", commit_message]):
         # 'nothing to commit' の場合はrun_commandがTrueを返すので、
         # ここで処理が止まるのは、それ以外のコミットエラーの場合
@@ -71,3 +75,4 @@ def git_deploy():
 if __name__ == "__main__":
     print("Gitデプロイプロセスを開始します...")
     git_deploy()
+
