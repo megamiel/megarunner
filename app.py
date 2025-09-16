@@ -1,12 +1,10 @@
 from flask import Flask, request, jsonify
-import subprocess
 import sys
 import uuid
 import os
 import pg8000.dbapi
 import ssl
 import json
-import base64
 from dotenv import load_dotenv
 from urllib.parse import urlparse
 import inspect
@@ -33,7 +31,7 @@ def get_db_connection():
         database=parsed_url.path[1:], ssl_context=ssl_context
     )
 
-# --- 実行エンジン (以前のexecutor.pyのロジックを内包) ---
+# --- 実行エンジン (executor.pyのロジックを内包) ---
 ENTRYPOINT_BOILERPLATE = "def entrypoint(func): func._is_entrypoint = True; return func"
 class DatabaseConcierge:
     def __init__(self, script_id):
@@ -65,17 +63,42 @@ def execute_user_script(code_string, request_args, script_id):
             exec(full_code, scope)
             entry_func = next((obj for obj in scope.values() if callable(obj) and hasattr(obj, '_is_entrypoint')), None)
             if not entry_func: raise ValueError("No @entrypoint function found.")
+            
             db_concierge = DatabaseConcierge(script_id)
             entry_func.__globals__["db_set"] = db_concierge.set
             entry_func.__globals__["db_get"] = db_concierge.get
+
             sig = inspect.signature(entry_func)
             kwargs_to_pass = {}
+
+            # --- ★★★ ここからが、型を自動変換する魔法の部分です ★★★ ---
             for param in sig.parameters.values():
-                if param.name in request_args:
-                    kwargs_to_pass[param.name] = request_args[param.name]
+                param_name = param.name
+                if param_name in request_args:
+                    value = request_args[param_name]
+                    # 型ヒントが存在すれば、それに基づいて型変換を試みる
+                    if param.annotation is not inspect.Parameter.empty:
+                        try:
+                            # bool型のための特別な処理
+                            if param.annotation is bool:
+                                if isinstance(value, str) and value.lower() in ['true', '1', 'yes']:
+                                    value = True
+                                elif isinstance(value, str) and value.lower() in ['false', '0', 'no']:
+                                    value = False
+                                else:
+                                    value = bool(value)
+                            else:
+                                # int, float, str など、他の型に変換
+                                value = param.annotation(value)
+                        except (ValueError, TypeError):
+                            raise TypeError(f"Argument '{param_name}' could not be converted to the required type '{param.annotation.__name__}'. Received value: '{value}'")
+                    kwargs_to_pass[param_name] = value
                 elif param.default is inspect.Parameter.empty:
-                    raise TypeError(f"Missing required argument: '{param.name}'")
+                    raise TypeError(f"Missing required argument: '{param_name}'")
+            # --- ★★★ 魔法ここまで ★★★ ---
+            
             result["return_value"] = entry_func(**kwargs_to_pass)
+
     except Exception as e:
         print(f"Execution Error: {e}", file=sys.stderr)
         result["error"] = str(e)
@@ -114,30 +137,51 @@ def run_code(script_id):
         if result: code_to_run = result[0]
     except Exception as e: return jsonify({'error': f'Database error: {str(e)}'}), 500
     if not code_to_run: return jsonify({'error': 'Script not found'}), 404
+    
     args = request.args.to_dict() if request.method == 'GET' else (request.get_json(silent=True) or {})
+    
     final_result = execute_user_script(code_to_run, args, script_id)
     return jsonify(final_result)
 
-# --- ★★★ これが最後の、そして最も重要な変更点です ★★★ ---
 if __name__ == "__main__":
-    # Flaskの開発用サーバーを「デバッグモード」で起動します
     app.run(debug=True)
 # ```
 
 # ---
 
-# ### 次のステップ：最後の起動と、本当の原因の特定
+# ### 次のステップ：最後のテスト
 
-# 1.  この新しい`app.py`を保存します。
+# 1.  **新しいユーザーファイルを作成:**
+#     `type_hinted_counter.py` という名前で、ユーザーが書くべき、型ヒント付きの新しいスクリプトを作成します。
 
-# 2.  ターミナルで、仮想環境が有効になっている（`(venv)`と表示されている）状態で、**あの最も確実なコマンド**でサーバーを起動します。
-#     ```bash
-#     .\venv\Scripts\python.exe app.py
+#     ```python
+#     @entrypoint
+#     def counter(increment_by: int = 1):
+#         current_visits = db_get("visits") or 0
+#         # ★ ここで int() を書く必要は、もうありません！
+#         new_visits = current_visits + increment_by
+#         db_set("visits", new_visits)
+#         return f"This function has been executed {new_visits} time(s)."
 #     ```
-#     *(もしサーバーが動いたままなら、`Ctrl + C`で一度停止してから再起動してください)*
 
-# 3.  サーバーが起動したら、**別のターミナル**を開き、**以前`500エラー`が出た時と全く同じ`upload.py`のコマンド**を、もう一度実行してください！
+# 2.  **ローカルサーバーを再起動:**
+#     `.\venv\Scripts\python.exe app.py` で、更新した`app.py`を起動します。
+
+# 3.  **アップロード:**
 #     ```bash
-#     python upload.py stateful_counter.py
-    
+#     python upload.py type_hinted_counter.py
+#     ```
+
+# 4.  **実行:** `upload.py`で返ってきたIDを使って、**正しい使い方**で`run.py`を実行します。
+#     ```bash
+#     python run.py YOUR_SCRIPT_ID increment_by=1000
+#     ```
+
+# **期待される結果:**
+# 今度こそ、`run.py`は引数を正しくAPIに渡し、APIは`"1000"`という文字列を`1000`という**整数**に自動変換して実行するため、エラーは一切出ずに、完璧な結果が返ってきます！
+
+# ```json
+# {
+#   "return_value": "This function has been executed 1001 time(s)."
+# }
 
