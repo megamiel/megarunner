@@ -3,8 +3,8 @@ import requests
 import json
 
 # APIのベースURL
-# RUN_URL = "http://127.0.0.1:5000/api/run/"
-RUN_URL = "https://megarunner.vercel.app/api/run/"
+RUN_URL = "http://127.0.0.1:5000/api/run/"
+# RUN_URL = "https://megarunner.vercel.app/api/run/"
 
 def run_script(script_id, args):
     """指定されたscript_idのスクリプトを、名前付き引数を渡して実行する"""

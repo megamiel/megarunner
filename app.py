@@ -10,32 +10,28 @@ from urllib.parse import urlparse
 import inspect
 import io
 import contextlib
-from dbutils.persistent_db import PersistentDB
 
 # --- 初期設定 ---
 load_dotenv('.env.development.local')
 DATABASE_URL = os.environ.get('POSTGRES_URL_NON_POOLING')
 app = Flask(__name__)
 
-# --- データベース接続プール ---
-if not DATABASE_URL:
-    raise ValueError("データベースの接続URLが環境変数に設定されていません。")
-parsed_url = urlparse(DATABASE_URL)
-ssl_context = ssl.create_default_context()
-ssl_context.check_hostname = False
-ssl_context.verify_mode = ssl.CERT_NONE
-db_pool = PersistentDB(
-    creator=pg8000.dbapi,
-    user=parsed_url.username, password=parsed_url.password,
-    host=parsed_url.hostname, port=parsed_url.port or 5432,
-    database=parsed_url.path[1:], ssl_context=ssl_context,
-    maxconnections=5, blocking=True
-)
-
+# --- データベース接続ヘルパー ---
 def get_db_connection():
-    return db_pool.connection()
+    if not DATABASE_URL:
+        raise ValueError("データベースの接続URLが環境変数に設定されていません。")
+    parsed_url = urlparse(DATABASE_URL)
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    db_port = parsed_url.port or 5432
+    return pg8000.dbapi.connect(
+        user=parsed_url.username, password=parsed_url.password,
+        host=parsed_url.hostname, port=db_port,
+        database=parsed_url.path[1:], ssl_context=ssl_context
+    )
 
-# --- 実行エンジン (旧executor.py) ---
+# --- 実行エンジン ---
 ENTRYPOINT_BOILERPLATE = "def entrypoint(func): func._is_entrypoint = True; return func"
 class DatabaseConcierge:
     def __init__(self, script_id):
@@ -43,7 +39,8 @@ class DatabaseConcierge:
     def set(self, key, value):
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO user_data (script_id, key, value) VALUES (%s, %s, %s) ON CONFLICT (script_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()", (self.script_id, key, json.dumps(value)))
+        # ★ 変更点: テーブル名を 'datastore' に変更
+        cursor.execute("INSERT INTO datastore (script_id, key, value) VALUES (%s, %s, %s) ON CONFLICT (script_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()", (self.script_id, key, json.dumps(value)))
         conn.commit()
         cursor.close()
         conn.close()
@@ -51,11 +48,30 @@ class DatabaseConcierge:
     def get(self, key):
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT value FROM user_data WHERE script_id = %s AND key = %s", (self.script_id, key))
+        # ★ 変更点: テーブル名を 'datastore' に変更
+        cursor.execute("SELECT value FROM datastore WHERE script_id = %s AND key = %s", (self.script_id, key))
         result = cursor.fetchone()
         cursor.close()
         conn.close()
         return result[0] if result else None
+    def delete(self, key):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # ★ 変更点: テーブル名を 'datastore' に変更
+        cursor.execute("DELETE FROM datastore WHERE script_id = %s AND key = %s", (self.script_id, key))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    def get_all(self):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # ★ 変更点: テーブル名を 'datastore' に変更
+        cursor.execute("SELECT key, value FROM datastore WHERE script_id = %s", (self.script_id,))
+        all_data = {row[0]: row[1] for row in cursor.fetchall()}
+        cursor.close()
+        conn.close()
+        return all_data
 
 def execute_user_script(code_string, request_args, script_id):
     result = {"stdout": "", "stderr": "", "return_value": None, "error": None}
@@ -71,10 +87,11 @@ def execute_user_script(code_string, request_args, script_id):
             db_concierge = DatabaseConcierge(script_id)
             entry_func.__globals__["db_set"] = db_concierge.set
             entry_func.__globals__["db_get"] = db_concierge.get
+            entry_func.__globals__["db_delete"] = db_concierge.delete
+            entry_func.__globals__["db_get_all"] = db_concierge.get_all
 
             sig = inspect.signature(entry_func)
             kwargs_to_pass = {}
-
             for param in sig.parameters.values():
                 param_name = param.name
                 if param_name in request_args:
@@ -110,6 +127,7 @@ def upload_code():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        # ★ 変更点: テーブル名を 'scripts' に変更 (以前のDROP TABLEで更新済み)
         cursor.execute("INSERT INTO scripts (id, code) VALUES (%s, %s)", (script_id, code))
         conn.commit()
         cursor.close()
@@ -123,6 +141,7 @@ def run_code(script_id):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        # ★ 変更点: テーブル名を 'scripts' に変更
         cursor.execute("SELECT code FROM scripts WHERE id = %s", (script_id,))
         result = cursor.fetchone()
         cursor.close()
