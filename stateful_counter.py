@@ -2,7 +2,7 @@
 # db_get と db_set を使って、自分のスクリプト専用のDBを操作できます。
 
 @entrypoint
-def counter(increment_by = 1):
+def counter(increment_by: int = 1):
     # 'visits'というキーで、訪問回数を取得。データがなければ0から始める
     current_visits = db_get("visits") or 0
     

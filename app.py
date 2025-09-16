@@ -10,28 +10,32 @@ from urllib.parse import urlparse
 import inspect
 import io
 import contextlib
+from dbutils.persistent_db import PersistentDB
 
 # --- 初期設定 ---
 load_dotenv('.env.development.local')
 DATABASE_URL = os.environ.get('POSTGRES_URL_NON_POOLING')
 app = Flask(__name__)
 
-# --- データベース接続ヘルパー ---
-def get_db_connection():
-    if not DATABASE_URL:
-        raise ValueError("データベースの接続URLが環境変数に設定されていません。")
-    parsed_url = urlparse(DATABASE_URL)
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
-    db_port = parsed_url.port or 5432
-    return pg8000.dbapi.connect(
-        user=parsed_url.username, password=parsed_url.password,
-        host=parsed_url.hostname, port=db_port,
-        database=parsed_url.path[1:], ssl_context=ssl_context
-    )
+# --- データベース接続プール ---
+if not DATABASE_URL:
+    raise ValueError("データベースの接続URLが環境変数に設定されていません。")
+parsed_url = urlparse(DATABASE_URL)
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+db_pool = PersistentDB(
+    creator=pg8000.dbapi,
+    user=parsed_url.username, password=parsed_url.password,
+    host=parsed_url.hostname, port=parsed_url.port or 5432,
+    database=parsed_url.path[1:], ssl_context=ssl_context,
+    maxconnections=5, blocking=True
+)
 
-# --- 実行エンジン (executor.pyのロジックを内包) ---
+def get_db_connection():
+    return db_pool.connection()
+
+# --- 実行エンジン (旧executor.py) ---
 ENTRYPOINT_BOILERPLATE = "def entrypoint(func): func._is_entrypoint = True; return func"
 class DatabaseConcierge:
     def __init__(self, script_id):
@@ -71,34 +75,23 @@ def execute_user_script(code_string, request_args, script_id):
             sig = inspect.signature(entry_func)
             kwargs_to_pass = {}
 
-            # --- ★★★ ここからが、型を自動変換する魔法の部分です ★★★ ---
             for param in sig.parameters.values():
                 param_name = param.name
                 if param_name in request_args:
                     value = request_args[param_name]
-                    # 型ヒントが存在すれば、それに基づいて型変換を試みる
                     if param.annotation is not inspect.Parameter.empty:
                         try:
-                            # bool型のための特別な処理
                             if param.annotation is bool:
-                                if isinstance(value, str) and value.lower() in ['true', '1', 'yes']:
-                                    value = True
-                                elif isinstance(value, str) and value.lower() in ['false', '0', 'no']:
-                                    value = False
-                                else:
-                                    value = bool(value)
+                                value = str(value).lower() in ['true', '1', 'yes']
                             else:
-                                # int, float, str など、他の型に変換
                                 value = param.annotation(value)
                         except (ValueError, TypeError):
-                            raise TypeError(f"Argument '{param_name}' could not be converted to the required type '{param.annotation.__name__}'. Received value: '{value}'")
+                            raise TypeError(f"Argument '{param_name}' could not be converted to type '{param.annotation.__name__}'. Received: '{value}'")
                     kwargs_to_pass[param_name] = value
                 elif param.default is inspect.Parameter.empty:
                     raise TypeError(f"Missing required argument: '{param_name}'")
-            # --- ★★★ 魔法ここまで ★★★ ---
             
             result["return_value"] = entry_func(**kwargs_to_pass)
-
     except Exception as e:
         print(f"Execution Error: {e}", file=sys.stderr)
         result["error"] = str(e)
@@ -145,43 +138,3 @@ def run_code(script_id):
 
 if __name__ == "__main__":
     app.run(debug=True)
-# ```
-
-# ---
-
-# ### 次のステップ：最後のテスト
-
-# 1.  **新しいユーザーファイルを作成:**
-#     `type_hinted_counter.py` という名前で、ユーザーが書くべき、型ヒント付きの新しいスクリプトを作成します。
-
-#     ```python
-#     @entrypoint
-#     def counter(increment_by: int = 1):
-#         current_visits = db_get("visits") or 0
-#         # ★ ここで int() を書く必要は、もうありません！
-#         new_visits = current_visits + increment_by
-#         db_set("visits", new_visits)
-#         return f"This function has been executed {new_visits} time(s)."
-#     ```
-
-# 2.  **ローカルサーバーを再起動:**
-#     `.\venv\Scripts\python.exe app.py` で、更新した`app.py`を起動します。
-
-# 3.  **アップロード:**
-#     ```bash
-#     python upload.py type_hinted_counter.py
-#     ```
-
-# 4.  **実行:** `upload.py`で返ってきたIDを使って、**正しい使い方**で`run.py`を実行します。
-#     ```bash
-#     python run.py YOUR_SCRIPT_ID increment_by=1000
-#     ```
-
-# **期待される結果:**
-# 今度こそ、`run.py`は引数を正しくAPIに渡し、APIは`"1000"`という文字列を`1000`という**整数**に自動変換して実行するため、エラーは一切出ずに、完璧な結果が返ってきます！
-
-# ```json
-# {
-#   "return_value": "This function has been executed 1001 time(s)."
-# }
-
