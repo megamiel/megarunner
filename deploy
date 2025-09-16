@@ -69,9 +69,5 @@ def git_deploy():
     print("Vercelのダッシュボードでデプロイの進捗を確認してください。")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "master":
-        print("Gitデプロイプロセスを開始します...")
-        git_deploy()
-    else:
-        print("使い方: python deploy.py master")
-        print("警告: このコマンドは 'master' ブランチに直接プッシュします。")
+    print("Gitデプロイプロセスを開始します...")
+    git_deploy()
